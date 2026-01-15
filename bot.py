@@ -1,5 +1,4 @@
 import os
-import time
 import asyncio
 from telegram import Update
 from telegram.ext import (
@@ -12,13 +11,14 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
+CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
 EXPIRY_TIME = 900  # 15 minutes
 
-MOVIES = {}  # movie_id → data
+MOVIES = {}  # movie_code -> {file_id, title, type}
 
 
-# ================= AUTO DELETE =================
+# ---------------- AUTO DELETE ----------------
 async def auto_delete(bot, chat_id, message_id):
     await asyncio.sleep(EXPIRY_TIME)
     try:
@@ -27,82 +27,68 @@ async def auto_delete(bot, chat_id, message_id):
         pass
 
 
-# ================= ADMIN FILE ADD =================
-async def admin_file_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+# ---------------- CHANNEL LISTENER ----------------
+async def channel_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.channel_post
+    if not msg or not msg.caption:
         return
 
-    msg = update.message
-    if not msg.caption or not msg.caption.startswith("#"):
+    if not msg.caption.startswith("#"):
         return
 
-    movie_id = msg.caption.split()[0][1:]
-    title = msg.caption.split("\n", 1)[1] if "\n" in msg.caption else movie_id
+    movie_code = msg.caption.split()[0][1:]
+    title = msg.caption.split("\n", 1)[1] if "\n" in msg.caption else movie_code
 
-    if msg.video:
-        file_id = msg.video.file_id
-        ftype = "video"
-    elif msg.document:
+    if msg.document:
         file_id = msg.document.file_id
         ftype = "document"
+    elif msg.video:
+        file_id = msg.video.file_id
+        ftype = "video"
     else:
         return
 
-    MOVIES[movie_id] = {
-        "title": title,
+    MOVIES[movie_code] = {
         "file_id": file_id,
-        "type": ftype,
-        "time": time.time()
+        "title": title,
+        "type": ftype
     }
 
-    bot_username = (await context.bot.get_me()).username
-    deep_link = f"https://t.me/{bot_username}?start={movie_id}"
-
-    await msg.reply_text(
-        "✅ MOVIE ADDED\n\n"
-        f"🎬 {title}\n\n"
-        "🔗 Share this link in channel:\n"
-        f"{deep_link}\n\n"
-        "⚠️ Auto-deletes in 15 minutes"
-    )
+    print(f"[SAVED] {movie_code} -> {title}")
 
 
-# ================= START =================
+# ---------------- START ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
-            "🎬 Welcome!\n\n"
-            "Open a movie link from our channel."
+            "🎬 Open a movie link from our channel."
         )
         return
 
-    movie_id = context.args[0]
-    movie = MOVIES.get(movie_id)
+    code = context.args[0]
 
-    if not movie:
+    if code not in MOVIES:
         await update.message.reply_text(
-            "⏰ This movie is no longer available.\n"
-            "Check the channel for a new link."
+            "⏰ This movie is no longer available."
         )
         return
 
-    disclaimer = (
+    movie = MOVIES[code]
+
+    await update.message.reply_text(
         "⚠️ IMPORTANT NOTICE\n\n"
-        "This file will be AUTO-DELETED in 15 minutes.\n\n"
-        "👉 Save it to *Saved Messages* now.\n"
-        "👉 Do NOT share publicly.\n"
-        "👉 For educational use only.\n"
+        "This file will be auto-deleted in 15 minutes.\n"
+        "Please save it to *Saved Messages*.\n",
+        parse_mode="Markdown"
     )
 
-    await update.message.reply_text(disclaimer, parse_mode="Markdown")
-
-    if movie["type"] == "video":
-        sent = await update.message.reply_video(
+    if movie["type"] == "document":
+        sent = await update.message.reply_document(
             movie["file_id"],
             caption=f"🎬 {movie['title']}"
         )
     else:
-        sent = await update.message.reply_document(
+        sent = await update.message.reply_video(
             movie["file_id"],
             caption=f"🎬 {movie['title']}"
         )
@@ -112,10 +98,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ================= RUN =================
+# ---------------- RUN ----------------
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+app.add_handler(MessageHandler(filters.Chat(CHANNEL_ID), channel_listener))
 app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, admin_file_listener))
 
 app.run_polling()
