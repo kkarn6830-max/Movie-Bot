@@ -1,94 +1,121 @@
 import os
-import json
 import time
-import threading
-from flask import Flask
+import asyncio
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
+)
 
-# ================= ENV =================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-BOT_USERNAME = os.environ.get("BOT_USERNAME")
-ADMIN_ID = int(os.environ.get("ADMIN_ID"))
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
-MOVIE_FILE = "movies.json"
 EXPIRY_TIME = 900  # 15 minutes
 
-# ================= FLASK (RENDER NEEDS THIS) =================
-app = Flask(__name__)
+MOVIES = {}  # movie_id → data
 
-@app.route("/")
-def home():
-    return "OK", 200
 
-def start_flask():
-    port = int(os.environ.get("PORT"))  # RENDER PROVIDED PORT
-    app.run(host="0.0.0.0", port=port)
+# ================= AUTO DELETE =================
+async def auto_delete(bot, chat_id, message_id):
+    await asyncio.sleep(EXPIRY_TIME)
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except:
+        pass
 
-# ================= MOVIE HELPERS =================
-def load_movies():
-    if not os.path.exists(MOVIE_FILE):
-        return {}
-    with open(MOVIE_FILE, "r") as f:
-        return json.load(f)
 
-def save_movies(data):
-    with open(MOVIE_FILE, "w") as f:
-        json.dump(data, f, indent=4)
-
-# ================= BOT COMMANDS =================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("👋 Welcome! Click a movie link.")
-        return
-
-    movie_id = context.args[0]
-    movies = load_movies()
-
-    if movie_id not in movies:
-        await update.message.reply_text("❌ Movie not found or expired.")
-        return
-
-    movie = movies[movie_id]
-    if int(time.time()) - movie["added_at"] > EXPIRY_TIME:
-        await update.message.reply_text("⏰ Link expired.")
-        return
-
-    await update.message.reply_text(
-        f"🎬 {movie['title']}\n\n🔗 {movie['link']}"
-    )
-
-async def addmovie(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================= ADMIN FILE ADD =================
+async def admin_file_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
-    try:
-        text = " ".join(context.args)
-        movie_id, title, link = [x.strip() for x in text.split("|")]
+    msg = update.message
+    if not msg.caption or not msg.caption.startswith("#"):
+        return
 
-        movies = load_movies()
-        movies[movie_id] = {
-            "title": title,
-            "link": link,
-            "added_at": int(time.time())
-        }
-        save_movies(movies)
+    movie_id = msg.caption.split()[0][1:]
+    title = msg.caption.split("\n", 1)[1] if "\n" in msg.caption else movie_id
 
-        deep_link = f"https://t.me/{BOT_USERNAME}?start={movie_id}"
-        await update.message.reply_text(f"✅ Movie added\n{deep_link}")
+    if msg.video:
+        file_id = msg.video.file_id
+        ftype = "video"
+    elif msg.document:
+        file_id = msg.document.file_id
+        ftype = "document"
+    else:
+        return
 
-    except:
+    MOVIES[movie_id] = {
+        "title": title,
+        "file_id": file_id,
+        "type": ftype,
+        "time": time.time()
+    }
+
+    bot_username = (await context.bot.get_me()).username
+    deep_link = f"https://t.me/{bot_username}?start={movie_id}"
+
+    await msg.reply_text(
+        "✅ MOVIE ADDED\n\n"
+        f"🎬 {title}\n\n"
+        "🔗 Share this link in channel:\n"
+        f"{deep_link}\n\n"
+        "⚠️ Auto-deletes in 15 minutes"
+    )
+
+
+# ================= START =================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
         await update.message.reply_text(
-            "❌ Format:\n/addmovie id | title | link"
+            "🎬 Welcome!\n\n"
+            "Open a movie link from our channel."
+        )
+        return
+
+    movie_id = context.args[0]
+    movie = MOVIES.get(movie_id)
+
+    if not movie:
+        await update.message.reply_text(
+            "⏰ This movie is no longer available.\n"
+            "Check the channel for a new link."
+        )
+        return
+
+    disclaimer = (
+        "⚠️ IMPORTANT NOTICE\n\n"
+        "This file will be AUTO-DELETED in 15 minutes.\n\n"
+        "👉 Save it to *Saved Messages* now.\n"
+        "👉 Do NOT share publicly.\n"
+        "👉 For educational use only.\n"
+    )
+
+    await update.message.reply_text(disclaimer, parse_mode="Markdown")
+
+    if movie["type"] == "video":
+        sent = await update.message.reply_video(
+            movie["file_id"],
+            caption=f"🎬 {movie['title']}"
+        )
+    else:
+        sent = await update.message.reply_document(
+            movie["file_id"],
+            caption=f"🎬 {movie['title']}"
         )
 
-# ================= RUN BOT =================
-def run_bot():
-    tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
-    tg_app.add_handler(CommandHandler("start", start))
-    tg_app.add_handler(CommandHandler("addmovie", addmovie))
-    tg_app.run_polling()
+    asyncio.create_task(
+        auto_delete(context.bot, update.effective_chat.id, sent.message_id)
+    )
 
-if __name__ == "__main__":
-    threading.Thread(target=start_flask, daemon=True).start()
-    run_bot()
+
+# ================= RUN =================
+app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+app.add_handler(CommandHandler("start", start))
+app.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, admin_file_listener))
+
+app.run_polling()
